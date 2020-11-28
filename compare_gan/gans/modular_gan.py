@@ -473,7 +473,7 @@ class ModularGAN(AbstractGAN):
 
     return fs, ls
 
-  def _train_discriminator(self, features, labels, step, optimizer, params):
+  def _train_discriminator(self, features, labels, optimizer, params):
     features = features.copy()
     features["generated"] = tf.stop_gradient(features["generated"])
     # Set the random offset tensor for operations in tpu_random.py.
@@ -482,37 +482,24 @@ class ModularGAN(AbstractGAN):
     self.create_loss(features, labels, params=params)
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(
+      grad_var = optimizer.compute_gradients(
           self.d_loss,
-          var_list=self.discriminator.trainable_variables,
-          global_step=step)
-      with tf.control_dependencies([train_op]):
-        return tf.identity(self.d_loss)
+          var_list=self.discriminator.trainable_variables)
+      with tf.control_dependencies([grad_var]):
+        return tf.identity(self.d_loss), grad_var
 
-  def _train_generator(self, features, labels, step, optimizer, params):
+  def _train_generator(self, features, labels, optimizer, params):
     # Set the random offset tensor for operations in tpu_random.py.
     tpu_random.set_random_offset_from_features(features)
     # create_loss will set self.g_loss.
     self.create_loss(features, labels, params=params)
     update_ops = tf.get_collection(tf.GraphKeys.UPDATE_OPS)
     with tf.control_dependencies(update_ops):
-      train_op = optimizer.minimize(
+      grad_var = optimizer.compute_gradients(
           self.g_loss,
-          var_list=self.generator.trainable_variables,
-          global_step=step)
-      if self._g_use_ema:
-        g_vars = self.generator.trainable_variables
-        with tf.name_scope("generator_ema"):
-          logging.info("Creating moving averages of weights: %s", g_vars)
-          # The decay value is set to 0 if we're before the moving-average start
-          # point, so that the EMA vars will be the normal vars.
-          decay = self._ema_decay * tf.cast(
-              tf.greater_equal(step, self._ema_start_step), tf.float32)
-          ema = tf.train.ExponentialMovingAverage(decay=decay)
-          with tf.control_dependencies([train_op]):
-            train_op = ema.apply(g_vars)
-      with tf.control_dependencies([train_op]):
-        return tf.identity(self.g_loss)
+          var_list=self.generator.trainable_variables)
+      with tf.control_dependencies([grad_var]):
+        return tf.identity(self.g_loss), grad_var
 
   def model_fn(self, features, labels, params, mode):
     """Constructs the model for the given features and mode.
@@ -535,6 +522,7 @@ class ModularGAN(AbstractGAN):
     if mode != tf.estimator.ModeKeys.TRAIN:
       raise ValueError("Only training mode is supported.")
 
+    accumulation_steps = params["accumulation_steps"]
     use_tpu = params["use_tpu"]
     unroll_graph = self._experimental_force_graph_unroll or use_tpu
     num_sub_steps = self._get_num_sub_steps(unroll_graph=unroll_graph)
@@ -548,65 +536,77 @@ class ModularGAN(AbstractGAN):
     self._tpu_summary = tpu_summaries.TpuSummaries(self._model_dir)
 
     # Get features for each sub-step.
-    fs, ls = self._split_inputs_and_generate_samples(
-        features, labels, num_sub_steps=num_sub_steps)
 
-    disc_optimizer = self.get_disc_optimizer(params["use_tpu"])
-    disc_step = tf.get_variable(
+    dis_optimizer = self.get_disc_optimizer(params["use_tpu"])
+    dis_step = tf.get_variable(
         "global_step_disc", [], dtype=tf.int32, trainable=False)
     train_disc_fn = functools.partial(
         self._train_discriminator,
-        step=disc_step,
-        optimizer=disc_optimizer,
+        #step=dis_step,
+        optimizer=dis_optimizer,
         params=params)
 
     gen_optimizer = self.get_gen_optimizer(params["use_tpu"])
     gen_step = tf.train.get_or_create_global_step()
     train_gen_fn = functools.partial(
         self._train_generator,
-        features=fs[-1],
-        labels=ls[-1],
-        step=gen_step,
+        #step=gen_step,
         optimizer=gen_optimizer,
         params=params)
 
     if not unroll_graph and self._disc_iters != 1:
       train_fn = train_gen_fn
       train_gen_fn = lambda: tf.cond(
-          tf.equal(disc_step % self._disc_iters, 0), train_fn, lambda: 0.0)
+          tf.equal(dis_step % self._disc_iters, 0), train_fn, lambda: 0.0)
 
     # Train D.
     d_losses = []
+    g_losses = []
+    d_gradients = None
+    g_gradients = None
     d_steps = self._disc_iters if unroll_graph else 1
-    for i in range(d_steps):
-      with tf.name_scope("disc_step_{}".format(i + 1)):
-        with tf.control_dependencies(d_losses):
-          d_losses.append(train_disc_fn(features=fs[i], labels=ls[i]))
+    for _ in range(accumulation_steps):
+      features, labels = self._split_inputs_and_generate_samples(features, 
+                                                                 labels, 
+                                                                 num_sub_steps=num_sub_steps)
+      for i in range(d_steps):
+        with tf.name_scope("dis_step_{}".format(i + 1)):
+          with tf.control_dependencies(d_losses):
+            d_loss, d_grad = train_disc_fn(features=features[i], labels=labels[i]) 
+            d_losses.append(d_loss)
+          d_gradients = ([d_gradients[i].assign_add(grad) for i, (grad, _) in enumerate(d_grad)] 
+                         if d_gradients is not None else d_grad)
+      # Train G.
+      with tf.control_dependencies(d_losses):
+        with tf.name_scope("gen_step"):
+          g_loss, g_grad = train_gen_fn(features=features[-1], labels=labels[-1])
+          g_losses.append(d_loss)
+        g_gradients = ([g_gradients[i].assign_add(grad]) for i, (grad, _) in enumerate(g_grad)] 
+                       if g_gradients is not None else g_grad)
+    with tf.control_dependencies([g_gradients, d_gradients, d_grad, g_grad]):
+      train_step = (dis_optimizer.apply_gradients([(grad, var) for grad, (_, var) in zip(d_gradients, d_grad)], global_step=dis_step),
+                    gen_optimizer.apply_gradients([(grad, var) for grad, (_, var) in zip(g_gradients, g_grad)], global_step=gen_step))
 
-    # Train G.
-    with tf.control_dependencies(d_losses):
-      with tf.name_scope("gen_step"):
-        g_loss = train_gen_fn()
+    with tf.control_dependencies(train_step):
+      for i, d_loss in enumerate(d_losses):
+        self._tpu_summary.scalar("loss/d_{}".format(i), d_loss)
+      self._tpu_summary.scalar("loss/g", g_loss)
+      self._add_images_to_summary(fs[0]["generated"], "fake_images", params)
+      self._add_images_to_summary(fs[0]["images"], "real_images", params)
 
-    for i, d_loss in enumerate(d_losses):
-      self._tpu_summary.scalar("loss/d_{}".format(i), d_loss)
-    self._tpu_summary.scalar("loss/g", g_loss)
-    self._add_images_to_summary(fs[0]["generated"], "fake_images", params)
-    self._add_images_to_summary(fs[0]["images"], "real_images", params)
+      self._check_variables()
+      utils.log_parameter_overview(self.generator.trainable_variables,
+                                   msg="Generator variables:")
+      utils.log_parameter_overview(self.discriminator.trainable_variables,
+                                   msg="Discriminator variables:")
 
-    self._check_variables()
-    utils.log_parameter_overview(self.generator.trainable_variables,
-                                 msg="Generator variables:")
-    utils.log_parameter_overview(self.discriminator.trainable_variables,
-                                 msg="Discriminator variables:")
-
-    return tf.contrib.tpu.TPUEstimatorSpec(
-        mode=mode,
-        host_call=self._tpu_summary.get_host_call(),
-        # Estimator requires a loss which gets displayed on TensorBoard.
-        # The given Tensor is evaluated but not used to create gradients.
-        loss=d_losses[0],
-        train_op=g_loss.op)
+      return tf.contrib.tpu.TPUEstimatorSpec(
+          mode=mode,
+          host_call=self._tpu_summary.get_host_call(),
+          # Estimator requires a loss which gets displayed on TensorBoard.
+          # The given Tensor is evaluated but not used to create gradients.
+          loss=d_losses[0],
+          train_op=g_loss.op)
 
   def get_disc_optimizer(self, use_tpu=True):
     opt = self._d_optimizer_fn(self._d_lr, name="d_opt")
