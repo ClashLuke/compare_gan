@@ -47,6 +47,35 @@ import re
 
 FLAGS = flags.FLAGS
 
+def differentiable_augmentation(img):
+  original_size = img.shape[1]
+
+  # RandomFlip
+  flips = tf.random.uniform([3], 0, 1)
+  if flips[0] > 0.5:
+    img = tf.reverse(img, 1)
+  if flips[1] > 0.5:
+    img = tf.reverse(img, 2)
+  if flips[2] > 0.5:
+    img = tf.image.rot90(img)
+  
+  # Pad+RandomResizedCrop
+  pad_size = original_size // 4
+  crops = tf.random.uniform([4], -pad_size, pad_size * 2, dtype=tf.dtypes.int32)
+  max_crops = tf.clip_by_value(crops, 0, pad_size * 2)
+  min_crops = -tf.clip_by_value(crops, -pad_size, 0)
+  img = tf.pad(img, [[min_crops[0], min_crops[1]], [min_crops[2], min_crops[3]], [0, 0]])
+  img = tf.slice(img, [max_crops[0], max_crops[1], 0], [original_size-max_crops[2], original_size-max_crops[3], 3])
+  img = tf.image.resize(img, (original_size,)*2)
+
+  # GaussianNoise (contrast), GaussianDropout (color), BrightnessJitter, ContrastJitter 
+  img = img * tf.random.normal(img.shape, 1, 0.05)
+  img = img * tf.random.normal([1], 1, 0.25)
+  img = img + tf.random.normal(img.shape, 0, 0.05)
+  img = img + tf.random.normal([1], 0, 0.25)
+
+  return img
+
 flags.DEFINE_string(
     "tfds_data_dir", None,
     "TFDS (TensorFlow Datasets) directory. If not set it will default to "
@@ -245,7 +274,7 @@ class ImageNet(object):
 
     if parse_dataset:
       def dataset_parser(value):
-        return ImageNet.dataset_parser_static(value, num_classes)
+        return differentiable_augmentation(ImageNet.dataset_parser_static(value, num_classes))
 
       dataset = dataset.map(
           dataset_parser,
