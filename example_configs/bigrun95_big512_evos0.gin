@@ -19,17 +19,17 @@ begin_run.model_dir = 'gs://doto-euw4a/runs/bigrun95_big512_evos0/run2'
 
 # Parameters for discriminator/resnet_biggan.BigGanResNetBlock:
 # ==============================================================================
-discriminator/resnet_biggan.BigGanResNetBlock.use_relu = True
+discriminator/resnet_biggan.BigGanResNetBlock.use_relu = False
 
 # Parameters for generator/resnet_biggan.BigGanResNetBlock:
 # ==============================================================================
 generator/resnet_biggan.BigGanResNetBlock.add_shortcut = True
-generator/resnet_biggan.BigGanResNetBlock.use_relu = True
+generator/resnet_biggan.BigGanResNetBlock.use_relu = False
 
 # Parameters for ema/generator/resnet_biggan.BigGanResNetBlock:
 # ==============================================================================
 ema/generator/resnet_biggan.BigGanResNetBlock.add_shortcut = True
-ema/generator/resnet_biggan.BigGanResNetBlock.use_relu = True
+ema/generator/resnet_biggan.BigGanResNetBlock.use_relu = False
 
 # Parameters for generator/conditional_batch_norm:
 # ==============================================================================
@@ -96,7 +96,7 @@ resnet_biggan.Generator.plain_tanh = False
 resnet_biggan.Generator.randomize_noise = True
 resnet_biggan.Generator.stylegan_z = False
 resnet_biggan.Generator.use_noise = False
-resnet_biggan.Generator.use_relu = True
+resnet_biggan.Generator.use_relu = False
 
 # Parameters for hinge:
 # ==============================================================================
